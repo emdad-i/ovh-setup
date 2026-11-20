@@ -1,0 +1,31 @@
+version: v3
+
+teleport:
+  nodename: "{{ teleport_domain_or_ip }}"
+  data_dir: /var/lib/teleport
+  log:
+    output: stderr
+    severity: INFO
+
+auth_service:
+  enabled: "yes"
+  cluster_name: "{{ teleport_domain_or_ip }}"
+  listen_addr: 0.0.0.0:3025
+  # All proxy traffic (web, SSH, tunnels) is multiplexed on the web port.
+  proxy_listener_mode: multiplex
+
+ssh_service:
+  enabled: "yes"
+  listen_addr: 0.0.0.0:3022
+  labels:
+    role: vps
+
+proxy_service:
+  enabled: "yes"
+  # This is the HTTPS/web listener. ACME (TLS-ALPN-01) requires it to be
+  # reachable on port 443 from the internet.
+  web_listen_addr: 0.0.0.0:443
+  public_addr: "{{ teleport_domain_or_ip }}:443"
+  acme:
+    enabled: "yes"
+    email: "{{ teleport_acme_email }}"

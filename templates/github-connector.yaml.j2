@@ -1,0 +1,20 @@
+kind: github
+version: v3
+metadata:
+  name: github
+spec:
+  client_id: "{{ github_oauth_client_id }}"
+  client_secret: "{{ github_oauth_client_secret }}"
+  redirect_url: "https://{{ teleport_domain_or_ip }}/v1/webapi/github/callback"
+  display: "GitHub SSO"
+  teams_to_roles:
+    - organization: "{{ github_org }}"
+      team: "{{ github_admin_team }}"
+      roles:
+        - "{{ teleport_admin_role | default('vps-admin') }}"
+{% if github_developer_team | default('') | length > 0 %}
+    - organization: "{{ github_org }}"
+      team: "{{ github_developer_team }}"
+      roles:
+        - "{{ teleport_developer_role | default('vps-developer') }}"
+{% endif %}

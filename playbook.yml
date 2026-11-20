@@ -1,0 +1,242 @@
+---
+- name: Deploy Teleport Community Edition with GitHub SSO
+  hosts: teleport
+  become: true
+
+  vars:
+    teleport_config_path: /etc/teleport.yaml
+    teleport_bootstrap_dir: /tmp/teleport-bootstrap
+    github_connector_temp_path: "{{ teleport_bootstrap_dir }}/github-connector.yaml"
+
+    teleport_admin_role: vps-admin
+    teleport_developer_role: vps-developer
+    github_developer_team: ""
+
+    # Teleport roles created by this playbook. Static logins are required
+    # because GitHub team membership only maps to roles, never to OS logins.
+    teleport_roles:
+      - name: "{{ teleport_admin_role }}"
+        logins:
+          - root
+          - ubuntu
+      - name: "{{ teleport_developer_role }}"
+        logins:
+          - ubuntu
+
+    # SSH port is overridable from vars.yml / CI without touching inventory.ini.
+    ansible_port: "{{ ansible_ssh_port | default(22) }}"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - teleport_domain_or_ip is defined
+          - teleport_domain_or_ip | length > 0
+          - teleport_acme_email is defined
+          - teleport_acme_email | length > 0
+          - github_org is defined and github_org | length > 0
+          - github_admin_team is defined and github_admin_team | length > 0
+          - github_oauth_client_id is defined and github_oauth_client_id | length > 0
+          - github_oauth_client_secret is defined and github_oauth_client_secret | length > 0
+        fail_msg: >-
+          Missing variables. Copy vars.example.yml to vars.yml and fill it in,
+          or set the GitHub Actions secrets listed in the README.
+
+    - name: Reset the bootstrap temp directory
+      ansible.builtin.file:
+        path: "{{ teleport_bootstrap_dir }}"
+        state: absent
+
+    - name: Create the bootstrap temp directory
+      ansible.builtin.file:
+        path: "{{ teleport_bootstrap_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    # ---------------------------------------------------------------------
+    # Teleport package
+    # ---------------------------------------------------------------------
+
+    - name: Ensure required packages are installed
+      ansible.builtin.apt:
+        name:
+          - curl
+          - gnupg
+          - tar
+          - ca-certificates
+        state: present
+        update_cache: true
+
+    - name: Ensure apt keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Download Teleport APT repository GPG key
+      ansible.builtin.get_url:
+        url: https://deb.releases.teleport.dev/teleport-pubkey.asc
+        dest: /tmp/teleport-pubkey.asc
+        mode: '0644'
+
+    - name: Remove any stale Teleport keyring before converting the key
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/teleport-archive-keyring.gpg
+        state: absent
+
+    - name: Convert Teleport public key to a binary keyring
+      ansible.builtin.command:
+        cmd: gpg --dearmor --yes --output /etc/apt/keyrings/teleport-archive-keyring.gpg /tmp/teleport-pubkey.asc
+      args:
+        creates: /etc/apt/keyrings/teleport-archive-keyring.gpg
+
+    - name: Set permissions on the Teleport keyring
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/teleport-archive-keyring.gpg
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Remove temporary Teleport public key file
+      ansible.builtin.file:
+        path: /tmp/teleport-pubkey.asc
+        state: absent
+
+    - name: Add Teleport APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/teleport-archive-keyring.gpg] https://deb.releases.teleport.dev/ stable main"
+        filename: teleport
+        state: present
+        update_cache: true
+
+    - name: Install Teleport package
+      ansible.builtin.apt:
+        name: "{{ ('teleport=' ~ teleport_version) if (teleport_version | default('') | length > 0) else 'teleport' }}"
+        state: "{{ 'present' if (teleport_version | default('') | length > 0) else 'latest' }}"
+        update_cache: true
+
+    # ---------------------------------------------------------------------
+    # Teleport configuration
+    # ---------------------------------------------------------------------
+
+    - name: Deploy Teleport configuration
+      ansible.builtin.template:
+        src: templates/teleport.yaml.j2
+        dest: "{{ teleport_config_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+      register: teleport_config
+
+    - name: Enable and restart the Teleport service
+      ansible.builtin.systemd:
+        name: teleport
+        enabled: true
+        state: "{{ 'restarted' if teleport_config.changed else 'started' }}"
+        daemon_reload: true
+
+    - name: Wait for the Teleport auth and web listeners
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ item }}"
+        state: started
+        delay: 3
+        timeout: 180
+      loop:
+        - 3025
+        - 443
+
+    # ---------------------------------------------------------------------
+    # Roles + GitHub connector (dynamic Teleport resources)
+    # ---------------------------------------------------------------------
+
+    - name: Deploy Teleport RBAC roles
+      ansible.builtin.template:
+        src: templates/teleport-role.yaml.j2
+        dest: "{{ teleport_bootstrap_dir }}/role-{{ item.name }}.yaml"
+        owner: root
+        group: root
+        mode: '0600'
+      loop: "{{ teleport_roles }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Apply Teleport RBAC roles
+      ansible.builtin.command:
+        cmd: "tctl create --force {{ teleport_bootstrap_dir }}/role-{{ item.name }}.yaml"
+      loop: "{{ teleport_roles }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: create_roles
+      changed_when: "'has been created' in create_roles.stdout or 'has been updated' in create_roles.stdout"
+
+    - name: Deploy GitHub connector definition to a temporary file
+      ansible.builtin.template:
+        src: templates/github-connector.yaml.j2
+        dest: "{{ github_connector_temp_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+      # Never print this file, even with --diff: it contains the OAuth secret.
+      diff: false
+
+    - name: Register the GitHub connector with Teleport
+      ansible.builtin.command:
+        cmd: "tctl create --force {{ github_connector_temp_path }}"
+      register: create_connector
+      changed_when: "'has been created' in create_connector.stdout or 'has been updated' in create_connector.stdout"
+      no_log: true
+
+    # ---------------------------------------------------------------------
+    # Optional native-SSH restriction
+    # ---------------------------------------------------------------------
+
+    - name: Restrict native SSH authentication to the control CIDR
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: '# {mark} ANSIBLE TELEPORT SSH RESTRICTION'
+        block: |
+          Match Address *,!{{ ssh_control_allow_cidr }}
+            DenyUsers *
+      when: ssh_control_allow_cidr | default('') | length > 0
+      register: ssh_restriction
+
+    - name: Remove the SSH restriction when no CIDR is configured
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: '# {mark} ANSIBLE TELEPORT SSH RESTRICTION'
+        state: absent
+      when: ssh_control_allow_cidr | default('') | length == 0
+      register: ssh_restriction_removed
+
+    - name: Validate the OpenSSH configuration
+      ansible.builtin.command:
+        cmd: sshd -t
+      changed_when: false
+      when: ssh_restriction.changed or ssh_restriction_removed.changed
+
+    - name: Restart OpenSSH after changing the restriction
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+      when: ssh_restriction.changed or ssh_restriction_removed.changed
+
+    # ---------------------------------------------------------------------
+    # Cleanup
+    # ---------------------------------------------------------------------
+
+    - name: Remove temporary bootstrap files containing secrets
+      ansible.builtin.file:
+        path: "{{ teleport_bootstrap_dir }}"
+        state: absent
+
+    - name: Show the login command
+      ansible.builtin.debug:
+        msg:
+          - "Deployment complete."
+          - "Log in with: tsh login --proxy={{ teleport_domain_or_ip }} --auth=github"
+          - "Then connect with: tsh ssh ubuntu@{{ teleport_domain_or_ip }}"

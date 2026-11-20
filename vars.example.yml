@@ -1,0 +1,37 @@
+---
+# Copy this file to vars.yml and fill in the values.
+# vars.yml is gitignored and must never be committed.
+
+# --- Host / TLS ---------------------------------------------------------
+# Public DNS name that points at the VPS. Teleport gets its Let's Encrypt
+# certificate for this name, so port 443 must be reachable from the internet.
+teleport_domain_or_ip: "vps.example.com"
+teleport_acme_email: "you@example.com"
+
+# --- SSH ----------------------------------------------------------------
+# Port the Ansible control host uses to reach the VPS.
+ansible_ssh_port: 22
+
+# Optional path to the private key used for the Ansible SSH connection.
+# ansible_ssh_private_key_file: "~/.ssh/id_ed25519"
+
+# --- GitHub SSO ---------------------------------------------------------
+# Teleport's GitHub connector maps GitHub ORGANIZATION TEAMS to Teleport
+# roles. A personal GitHub account alone cannot be used: create a free
+# GitHub organization, add yourself to it, then create the teams below.
+# See the README for the full walkthrough.
+github_org: "your-github-org"
+# A free one-person org is fine. Use the built-in "owners" team for a solo
+# setup, or a team you created (e.g. "vps-admins") if you prefer.
+github_admin_team: "vps-admins"
+# github_developer_team: "vps-devs"
+
+# GitHub OAuth app credentials (Settings -> Developer settings -> OAuth Apps).
+github_oauth_client_id: ""
+github_oauth_client_secret: ""
+
+# --- Optional hardening -------------------------------------------------
+# Only allow native SSH authentication from this CIDR. Teleport access is
+# unaffected. NOTE: if you deploy from GitHub Actions, the runner IP is not
+# in this range and the workflow will stop being able to connect.
+# ssh_control_allow_cidr: "203.0.113.10/32"

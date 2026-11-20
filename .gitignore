@@ -1,0 +1,22 @@
+# Ansible artifacts
+*.retry
+*.log
+.ansible/
+
+# Python / local tooling
+.venv/
+__pycache__/
+*.pyc
+
+# Local secrets and generated CI variables
+vars.yml
+vars.local.yml
+vars.ci.yml
+*.pem
+*.key
+*.crt
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

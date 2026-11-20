@@ -1,0 +1,14 @@
+kind: role
+version: v7
+metadata:
+  name: "{{ item.name }}"
+spec:
+  allow:
+    logins:
+{% for login in item.logins %}
+      - "{{ login }}"
+{% endfor %}
+    node_labels:
+      '*': '*'
+  options:
+    max_session_ttl: "{{ item.max_session_ttl | default('12h') }}"

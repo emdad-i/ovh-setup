@@ -1,0 +1,167 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_mode:
+        description: "Dry run: report changes without applying them"
+        type: boolean
+        default: false
+      teleport_version:
+        description: "Pin a Teleport package version (leave blank for latest)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-teleport
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Ansible deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Secrets for this job live in the "production" environment, not in the
+    # repository files. Add protection rules under
+    # Settings -> Environments -> production:
+    #   - Required reviewers (you) so every deploy needs approval
+    #   - Deployment branches: main only
+    # GitHub creates the environment on first use if it does not exist.
+    environment: production
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Ansible
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Check required configuration
+        env:
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          TELEPORT_DOMAIN: ${{ vars.TELEPORT_DOMAIN }}
+          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
+          GITHUB_ADMIN_TEAM: ${{ vars.GITHUB_ADMIN_TEAM }}
+          GITHUB_OAUTH_CLIENT_ID: ${{ vars.GITHUB_OAUTH_CLIENT_ID }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.GITHUB_OAUTH_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in VPS_HOST TELEPORT_DOMAIN GITHUB_ORG GITHUB_ADMIN_TEAM \
+                      GITHUB_OAUTH_CLIENT_ID VPS_SSH_PRIVATE_KEY \
+                      GITHUB_OAUTH_CLIENT_SECRET; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing configuration value: ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Configure SSH
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          port="${VPS_SSH_PORT:-22}"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -p "$port" -H "$VPS_HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Render CI variables
+        env:
+          TELEPORT_DOMAIN: ${{ vars.TELEPORT_DOMAIN }}
+          TELEPORT_ACME_EMAIL: ${{ vars.TELEPORT_ACME_EMAIL }}
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT }}
+          GITHUB_ORG: ${{ vars.GITHUB_ORG }}
+          GITHUB_ADMIN_TEAM: ${{ vars.GITHUB_ADMIN_TEAM }}
+          GITHUB_DEVELOPER_TEAM: ${{ vars.GITHUB_DEVELOPER_TEAM }}
+          GITHUB_OAUTH_CLIENT_ID: ${{ vars.GITHUB_OAUTH_CLIENT_ID }}
+          GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.GITHUB_OAUTH_CLIENT_SECRET }}
+          SSH_CONTROL_ALLOW_CIDR: ${{ secrets.SSH_CONTROL_ALLOW_CIDR }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import yaml
+
+
+          def required(name):
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  raise SystemExit(f"Missing required value: {name}")
+              return value
+
+
+          domain = required("TELEPORT_DOMAIN")
+          vars_data = {
+              "teleport_domain_or_ip": domain,
+              "teleport_acme_email": os.environ.get("TELEPORT_ACME_EMAIL", "").strip()
+              or f"admin@{domain}",
+              "ansible_ssh_port": int(os.environ.get("VPS_SSH_PORT", "22").strip() or 22),
+              "github_org": required("GITHUB_ORG"),
+              "github_admin_team": required("GITHUB_ADMIN_TEAM"),
+              "github_oauth_client_id": required("GITHUB_OAUTH_CLIENT_ID"),
+              "github_oauth_client_secret": required("GITHUB_OAUTH_CLIENT_SECRET"),
+          }
+
+          developer_team = os.environ.get("GITHUB_DEVELOPER_TEAM", "").strip()
+          if developer_team:
+              vars_data["github_developer_team"] = developer_team
+
+          allow_cidr = os.environ.get("SSH_CONTROL_ALLOW_CIDR", "").strip()
+          if allow_cidr:
+              vars_data["ssh_control_allow_cidr"] = allow_cidr
+
+          with open("vars.ci.yml", "w", encoding="utf-8") as handle:
+              yaml.safe_dump(vars_data, handle, sort_keys=False)
+          os.chmod("vars.ci.yml", 0o600)
+          print("Rendered vars.ci.yml")
+          PY
+
+      - name: Run playbook
+        env:
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_USER: ${{ vars.VPS_USER }}
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT }}
+          CHECK_MODE: ${{ inputs.check_mode }}
+          TELEPORT_VERSION: ${{ inputs.teleport_version }}
+          ANSIBLE_HOST_KEY_CHECKING: "True"
+        run: |
+          set -euo pipefail
+          args=(
+            playbook.yml
+            -e @vars.ci.yml
+            -e "ansible_host=$VPS_HOST"
+            -e "ansible_user=${VPS_USER:-ubuntu}"
+            -e "ansible_ssh_port=${VPS_SSH_PORT:-22}"
+            -e "ansible_ssh_private_key_file=$HOME/.ssh/deploy_key"
+          )
+          if [ -n "${TELEPORT_VERSION:-}" ]; then
+            args+=(-e "teleport_version=$TELEPORT_VERSION")
+          fi
+          if [ "${CHECK_MODE}" = "true" ]; then
+            args+=(--check --diff)
+          fi
+          ansible-playbook "${args[@]}"
+
+      - name: Remove generated variables
+        if: always()
+        run: rm -f vars.ci.yml
